@@ -22,48 +22,44 @@ public class IngestionService {
     private final MasterPatientIndex index;
     private final Pseudonymizer pseudonymizer;
     private final AuditLog auditLog;
+    private final ReviewService reviewService;
 
     public IngestionService(List<MessageParser> parsers,
                             MasterPatientIndex index,
                             Pseudonymizer pseudonymizer,
-                            AuditLog auditLog) {
+                            AuditLog auditLog,
+                            ReviewService reviewService) {
         this.parsers = parsers;
         this.index = index;
         this.pseudonymizer = pseudonymizer;
         this.auditLog = auditLog;
+        this.reviewService = reviewService;
     }
 
     public IngestResponse ingest(String contentType, String body, String actor) {
-        MessageParser parser = parsers.stream()
-                .filter(p -> p.supports(contentType, body))
-                .findFirst()
-                .orElseThrow(() -> new IngestionException(
-                        IngestionException.RejectionReason.UNSUPPORTED_FORMAT,
-                        "cannot determine message format from content-type '" + contentType
-                                + "' and payload head"));
-
-        NormalizedPatient patient;
-        try {
-            patient = parser.parse(body);
-        } catch (IngestionException e) {
-            log.warn("[INGEST REJECT] actor={} format={} reason={} detail={} inputSummary={}",
-                    actor, parser.formatVersion(), e.getReason(), e.getMessage(), inputSummary(body));
-            auditLog.record(actor, "INGEST", null, null, null,
-                    "REJECTED:" + e.getReason(), e.getMessage());
-            throw e;
-        }
+        ParseOutcome parsed = parse(contentType, body, actor, "INGEST");
+        NormalizedPatient patient = parsed.patient();
+        MessageParser parser = parsed.parser();
 
         log.info("[INGEST ACCEPT] actor={} format={} inputSummary={}",
                 actor, parser.formatVersion(), patient.summary());
 
         MasterPatientIndex.MergeResult result;
         try {
-            result = index.upsert(patient);
+            // 冲突钩子在归并锁内、抛出前执行：原子登记复核待办。
+            // 对外仍抛出原始 CONTRADICTORY_DATA（钩子抛 REVIEW_QUEUE_FULL 时除外），
+            // 老接入方看到的冲突响应与之前完全一致。
+            result = index.upsert(patient, conflict ->
+                    reviewService.registerConflict(conflict, patient, actor));
         } catch (IngestionException e) {
             log.warn("[MERGE REJECT] actor={} reason={} basis={} inputSummary={}",
                     actor, e.getReason(), e.getMessage(), patient.summary());
+            // 登记钩子已写 INGEST_CONFLICT 审计；这里补正式接入维度留痕，
+            // detail 不含明文（冲突详情里只有 MPI id 与 canonical key 系统名）。
             auditLog.record(actor, "INGEST", null, null,
-                    firstIdentifierHash(patient), "REJECTED:" + e.getReason(), e.getMessage());
+                    firstIdentifierHash(patient), "REJECTED:" + e.getReason(),
+                    "rejected at ingestion (" + e.getReason()
+                            + "); see INGEST_CONFLICT for review routing");
             throw e;
         }
 
@@ -71,7 +67,7 @@ public class IngestionService {
         log.info("[MERGE OK] actor={} mpiId={} pseudonym={} created={} merged={} basis={}",
                 actor, result.mpiId(), pseudonym, result.created(), result.merged(), result.basis());
         List<String> safeBasis = result.basis().stream()
-                .map(this::hashIdentifierValues)
+                .map(e -> IngestionSupport.hashIdentifierValues(e, pseudonymizer))
                 .toList();
         auditLog.record(actor, "INGEST", result.mpiId(), pseudonym,
                 firstIdentifierHash(patient), "ACCEPTED",
@@ -81,20 +77,39 @@ public class IngestionService {
     }
 
     /**
-     * basis 文本形如 "matched identifier HOSPITAL_A|7001"，写入审计前把标识符值替换为哈希。
+     * 接入预检：与正式接入同一套 parser、同一套拒绝原因和同一套归一规则；
+     * 之后在索引快照上模拟归并，完全只读。
      */
-    private String hashIdentifierValues(String basisEntry) {
-        java.util.regex.Matcher matcher =
-                java.util.regex.Pattern.compile("([A-Z0-9_]+\\|)([^\\s\\]]+)").matcher(basisEntry);
-        StringBuilder sb = new StringBuilder();
-        while (matcher.find()) {
-            matcher.appendReplacement(sb,
-                    java.util.regex.Matcher.quoteReplacement(
-                            matcher.group(1) + pseudonymizer.hashIdentifier(
-                                    matcher.group(1) + matcher.group(2))));
+    public ReviewService.PreviewResult preview(String contentType, String body, String actor) {
+        ParseOutcome parsed = parse(contentType, body, actor, "PREVIEW");
+        return reviewService.preview(parsed.patient(), parsed.parser().formatVersion(), actor);
+    }
+
+    private ParseOutcome parse(String contentType, String body, String actor, String action) {
+        MessageParser parser = parsers.stream()
+                .filter(p -> p.supports(contentType, body))
+                .findFirst()
+                .orElseThrow(() -> new IngestionException(
+                        IngestionException.RejectionReason.UNSUPPORTED_FORMAT,
+                        "cannot determine message format from content-type '" + contentType
+                                + "' and payload head"));
+
+        try {
+            NormalizedPatient patient = parser.parse(body);
+            return new ParseOutcome(parser, patient);
+        } catch (IngestionException e) {
+            log.warn("[{} REJECT] actor={} format={} reason={} inputSummary={}",
+                    action, actor, parser.formatVersion(), e.getReason(), inputSummary(body));
+            // 写入审计前把可能出现的 canonical 标识符值替换成哈希，
+            // 保证审计不含原始标识符明文（原因码与对外拒绝完全一致）。
+            auditLog.record(actor, action, null, null, null,
+                    "REJECTED:" + e.getReason(),
+                    IngestionSupport.hashIdentifierValues(e.getMessage(), pseudonymizer));
+            throw e;
         }
-        matcher.appendTail(sb);
-        return sb.toString();
+    }
+
+    private record ParseOutcome(MessageParser parser, NormalizedPatient patient) {
     }
 
     private String firstIdentifierHash(NormalizedPatient patient) {

@@ -24,6 +24,20 @@ public class MasterPatientRecord {
         this.mpiId = mpiId;
     }
 
+    /**
+     * 深拷贝（预检在副本索引上模拟时使用，确保预检完全只读）。
+     */
+    MasterPatientRecord copy() {
+        MasterPatientRecord clone = new MasterPatientRecord(mpiId);
+        clone.identifiers.addAll(identifiers);
+        clone.identifierKeys.addAll(identifierKeys);
+        clone.familyName = familyName;
+        clone.givenName = givenName;
+        clone.birthDate = birthDate;
+        clone.gender = gender;
+        return clone;
+    }
+
     public String getMpiId() {
         return mpiId;
     }

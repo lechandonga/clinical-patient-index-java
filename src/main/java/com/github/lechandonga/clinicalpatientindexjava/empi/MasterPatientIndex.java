@@ -1,7 +1,7 @@
 package com.github.lechandonga.clinicalpatientindexjava.empi;
 
-import com.github.lechandonga.clinicalpatientindexjava.domain.IngestionException;
-import com.github.lechandonga.clinicalpatientindexjava.domain.IngestionException.RejectionReason;
+import com.github.lechandonga.clinicalpatientindexjava.domain.ConflictException;
+import com.github.lechandonga.clinicalpatientindexjava.domain.ConflictException.ConflictType;
 import com.github.lechandonga.clinicalpatientindexjava.domain.NormalizedPatient;
 import com.github.lechandonga.clinicalpatientindexjava.domain.PatientIdentifier;
 
@@ -29,62 +29,185 @@ public class MasterPatientIndex {
     private final ReentrantLock mergeLock = new ReentrantLock();
     private final Map<String, MasterPatientRecord> records = new ConcurrentHashMap<>();
     private final Map<String, String> identifierToMpi = new ConcurrentHashMap<>();
+    private final Map<String, String> mergedAway = new ConcurrentHashMap<>();
     private final AtomicLong sequence = new AtomicLong();
 
     public record MergeResult(String mpiId, boolean created, boolean merged, List<String> basis) {
     }
 
     public MergeResult upsert(NormalizedPatient patient) {
+        return upsert(patient, null);
+    }
+
+    /**
+     * @param conflictHook 发生人口学冲突时，在归并锁内、抛出前执行的回调
+     *                     （用于原子登记人工复核；预检传 null 表示只读，不登记）。
+     *                     回调自身可抛出异常以改变拒绝结果（如 REVIEW_QUEUE_FULL）。
+     */
+    public MergeResult upsert(NormalizedPatient patient,
+                              java.util.function.Consumer<ConflictException> conflictHook) {
+        mergeLock.lock();
+        try {
+            try {
+                return doUpsert(patient);
+            } catch (ConflictException conflict) {
+                if (conflictHook != null) {
+                    conflictHook.accept(conflict);
+                }
+                throw conflict;
+            }
+        } finally {
+            mergeLock.unlock();
+        }
+    }
+
+    private MergeResult doUpsert(NormalizedPatient patient) {
+        List<String> basis = new ArrayList<>();
+        MasterPatientRecord target = null;
+
+        for (PatientIdentifier identifier : patient.getIdentifiers()) {
+            String key = identifier.canonicalKey();
+            String existingMpi = identifierToMpi.get(key);
+            if (existingMpi == null) {
+                continue;
+            }
+            MasterPatientRecord existing = records.get(existingMpi);
+            if (target == null) {
+                target = existing;
+                basis.add("matched identifier " + key);
+            } else if (!existing.getMpiId().equals(target.getMpiId())) {
+                assertCompatible(target, existing, key, previouslyMergedIds(basis));
+                target = mergeInto(target, existing, basis, key);
+            }
+        }
+
+        boolean created = false;
+        boolean merged = target != null && !basis.isEmpty();
+        if (target == null) {
+            target = createRecord();
+            created = true;
+            basis.add("no matching identifier; created new MPI");
+        } else {
+            for (PatientIdentifier identifier : patient.getIdentifiers()) {
+                String mpi = identifierToMpi.get(identifier.canonicalKey());
+                if (mpi != null && mpi.equals(target.getMpiId())) {
+                    assertIncomingCompatible(target, patient, identifier.canonicalKey());
+                    break;
+                }
+            }
+        }
+
+        for (PatientIdentifier identifier : patient.getIdentifiers()) {
+            String previous = identifierToMpi.putIfAbsent(identifier.canonicalKey(), target.getMpiId());
+            if (previous == null || previous.equals(target.getMpiId())) {
+                target.addIdentifier(identifier);
+                if (previous == null) {
+                    basis.add("linked identifier " + identifier.canonicalKey());
+                } else {
+                    basis.add("identifier already known (idempotent) " + identifier.canonicalKey());
+                }
+            }
+        }
+        updateDemographics(target, patient, basis);
+        return new MergeResult(target.getMpiId(), created, merged, List.copyOf(basis));
+    }
+
+    /** 从 basis 文本中提取本次 upsert 已合入 target 的 MPI id（仅进程内使用）。 */
+    private static java.util.List<String> previouslyMergedIds(List<String> basis) {
+        java.util.List<String> ids = new java.util.ArrayList<>();
+        java.util.regex.Matcher matcher =
+                java.util.regex.Pattern.compile("\\bMPI-\\d{10}\\b").matcher(String.join(" ", basis));
+        while (matcher.find()) {
+            ids.add(matcher.group());
+        }
+        return ids;
+    }
+
+    /**
+     * 在主索引归并锁内执行动作。复核队列的登记/裁决都通过这里串行化，
+     * 保证裁决与新接入交叉时不会出现重复主索引、覆盖或半合并状态。
+     * 锁为可重入，动作内部再次调用 upsert 不会死锁。
+     */
+    public <T> T withMergeLock(java.util.function.Supplier<T> action) {
+        mergeLock.lock();
+        try {
+            return action.get();
+        } finally {
+            mergeLock.unlock();
+        }
+    }
+
+    /**
+     * 在索引的深拷贝快照上执行一次 upsert，绝不触碰本索引的任何状态。
+     * 供接入预检使用：同一条消息重复预检结果一致，且不会改变主索引、
+     * 标识归属或已有数据。冲突时抛出与正式接入完全相同的
+     * {@link ConflictException}（同样的 reason 与判定依据）。
+     */
+    public SnapshotOutcome simulate(NormalizedPatient patient) {
+        mergeLock.lock();
+        try {
+            MasterPatientIndex copy = snapshot();
+            String targetMpiBefore = firstMatchedMpiId(patient);
+            MasterPatientRecord before = targetMpiBefore == null ? null : copy.records.get(targetMpiBefore);
+            MergeResult result = copy.upsert(patient);
+            MasterPatientRecord after = copy.records.get(result.mpiId());
+            return new SnapshotOutcome(result, describeFieldEffects(before, after));
+        } finally {
+            mergeLock.unlock();
+        }
+    }
+
+    public record SnapshotOutcome(MergeResult result, List<FieldEffect> fieldEffects) {
+    }
+
+    /**
+     * 字段级效果：预检/复核记录据此说明哪些人口学字段会保留、哪些会补全，
+     * 以及取值来自哪里（existing / incoming / absorbed-cluster）。
+     */
+    public record FieldEffect(String field, String effect, String source, String after) {
+    }
+
+    /**
+     * 人工复核“批准合并”的原子操作：
+     * <ol>
+     *   <li>解析待办涉及的主索引（可能已因别的裁决被并走，按别名追踪）；</li>
+     *   <li>若仍是两个独立簇，强制合为一个，幸存者为 MPI id 字典序较小者，
+       * 字段按“幸存者已有值优先、空值由被并簇补全”取舍；</li>
+     *   <li>以宽松模式（跳过冲突护栏）应用原始提交：挂接新标识、仅补空值；</li>
+     *   <li>整个过程在同一把归并锁内完成，与新接入交叉时不会出现
+     *       重复主索引、覆盖或半合并状态。</li>
+     * </ol>
+     */
+    public MergeResult applyApprovedMerge(List<String> taskMpiIds, NormalizedPatient patient) {
         mergeLock.lock();
         try {
             List<String> basis = new ArrayList<>();
-            MasterPatientRecord target = null;
-
-            for (PatientIdentifier identifier : patient.getIdentifiers()) {
-                String key = identifier.canonicalKey();
-                String existingMpi = identifierToMpi.get(key);
-                if (existingMpi == null) {
+            MasterPatientRecord survivor = null;
+            for (String taskMpiId : taskMpiIds) {
+                String currentId = resolveMpi(taskMpiId);
+                MasterPatientRecord record = records.get(currentId);
+                if (record == null) {
                     continue;
                 }
-                MasterPatientRecord existing = records.get(existingMpi);
-                if (target == null) {
-                    target = existing;
-                    basis.add("matched identifier " + key);
-                } else if (!existing.getMpiId().equals(target.getMpiId())) {
-                    assertCompatible(target, existing, key);
-                    target = mergeInto(target, existing, basis, key);
-                }
-            }
-
-            boolean created = false;
-            boolean merged = target != null && !basis.isEmpty();
-            if (target == null) {
-                target = createRecord();
-                created = true;
-                basis.add("no matching identifier; created new MPI");
-            } else {
-                for (PatientIdentifier identifier : patient.getIdentifiers()) {
-                    String mpi = identifierToMpi.get(identifier.canonicalKey());
-                    if (mpi != null && mpi.equals(target.getMpiId())) {
-                        assertIncomingCompatible(target, patient, identifier.canonicalKey());
-                        break;
-                    }
-                }
-            }
-
-            for (PatientIdentifier identifier : patient.getIdentifiers()) {
-                String previous = identifierToMpi.putIfAbsent(identifier.canonicalKey(), target.getMpiId());
-                if (previous == null || previous.equals(target.getMpiId())) {
-                    target.addIdentifier(identifier);
-                    if (previous == null) {
-                        basis.add("linked identifier " + identifier.canonicalKey());
+                if (survivor == null) {
+                    survivor = record;
+                } else if (!record.getMpiId().equals(survivor.getMpiId())) {
+                    if (survivor.getMpiId().compareTo(record.getMpiId()) > 0) {
+                        survivor = forceMergeInto(record, survivor, basis, "manual review approval");
                     } else {
-                        basis.add("identifier already known (idempotent) " + identifier.canonicalKey());
+                        survivor = forceMergeInto(survivor, record, basis, "manual review approval");
                     }
                 }
             }
-            updateDemographics(target, patient, basis);
-            return new MergeResult(target.getMpiId(), created, merged, List.copyOf(basis));
+            if (survivor == null) {
+                survivor = createRecord();
+                basis.add("no reviewed MPI remained; created new MPI");
+            } else {
+                basis.add("approved by manual review; applying original submission to "
+                        + survivor.getMpiId());
+            }
+            lenientAttachAndFill(survivor, patient, basis);
+            return new MergeResult(survivor.getMpiId(), false, true, List.copyOf(basis));
         } finally {
             mergeLock.unlock();
         }
@@ -96,7 +219,7 @@ public class MasterPatientIndex {
     }
 
     public MasterPatientRecord findByMpiId(String mpiId) {
-        return records.get(mpiId);
+        return records.get(resolveMpi(mpiId));
     }
 
     public int recordCount() {
@@ -107,6 +230,168 @@ public class MasterPatientIndex {
         return identifierToMpi.size();
     }
 
+    private String resolveMpi(String mpiId) {
+        String current = mpiId;
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        while (seen.add(current)) {
+            String next = mergedAway.get(current);
+            if (next == null) {
+                return current;
+            }
+            current = next;
+        }
+        return current;
+    }
+
+    private MasterPatientIndex snapshot() {
+        MasterPatientIndex copy = new MasterPatientIndex();
+        copy.sequence.set(this.sequence.get());
+        for (Map.Entry<String, String> entry : identifierToMpi.entrySet()) {
+            copy.identifierToMpi.put(entry.getKey(), entry.getValue());
+        }
+        for (Map.Entry<String, MasterPatientRecord> entry : records.entrySet()) {
+            copy.records.put(entry.getKey(), entry.getValue().copy());
+        }
+        for (Map.Entry<String, String> entry : mergedAway.entrySet()) {
+            copy.mergedAway.put(entry.getKey(), entry.getValue());
+        }
+        return copy;
+    }
+
+    private String firstMatchedMpiId(NormalizedPatient patient) {
+        for (PatientIdentifier identifier : patient.getIdentifiers()) {
+            String mpi = identifierToMpi.get(identifier.canonicalKey());
+            if (mpi != null) {
+                return mpi;
+            }
+        }
+        return null;
+    }
+
+    private List<FieldEffect> describeFieldEffects(MasterPatientRecord before,
+                                                   MasterPatientRecord after) {
+        List<FieldEffect> effects = new ArrayList<>();
+        effects.add(fieldEffect("familyName", before == null ? null : before.getFamilyName(),
+                after.getFamilyName()));
+        effects.add(fieldEffect("givenName", before == null ? null : before.getGivenName(),
+                after.getGivenName()));
+        effects.add(fieldEffect("birthDate", before == null ? null : before.getBirthDate(),
+                after.getBirthDate()));
+        effects.add(fieldEffect("gender",
+                before == null || before.getGender() == null ? null : before.getGender().name(),
+                after.getGender() == null ? null : after.getGender().name()));
+        return List.copyOf(effects);
+    }
+
+    private static FieldEffect fieldEffect(String field, String before, String after) {
+        String effect;
+        String source;
+        if (after == null) {
+            effect = "UNSET";
+            source = "none";
+        } else if (before == null) {
+            effect = "FILLED";
+            source = "incoming";
+        } else if (before.equals(after)) {
+            effect = "KEPT";
+            source = "existing";
+        } else {
+            effect = "FILLED";
+            source = "merged-cluster";
+        }
+        return new FieldEffect(field, effect, source, sanitizeFieldValue(field, after));
+    }
+
+    /**
+     * 预检输出不允许出现出生日期明文：日期类字段只保留年份；
+     * 姓名字段只回“是否有值”，不回值本身。
+     */
+    private static String sanitizeFieldValue(String field, String value) {
+        if (value == null) {
+            return null;
+        }
+        if (field.equals("birthDate")) {
+            return value.length() >= 4 ? value.substring(0, 4) : "****";
+        }
+        if (field.equals("familyName") || field.equals("givenName")) {
+            return "<present>";
+        }
+        return value;
+    }
+
+    private MasterPatientRecord forceMergeInto(MasterPatientRecord survivor,
+                                               MasterPatientRecord absorbed,
+                                               List<String> basis,
+                                               String reason) {
+        for (String key : absorbed.getIdentifierKeys()) {
+            identifierToMpi.put(key, survivor.getMpiId());
+        }
+        for (PatientIdentifier identifier : absorbed.getIdentifiers()) {
+            survivor.addIdentifier(identifier);
+        }
+        fillField("familyName", survivor.getFamilyName(), absorbed.getFamilyName(),
+                survivor::setFamilyName, basis);
+        fillField("givenName", survivor.getGivenName(), absorbed.getGivenName(),
+                survivor::setGivenName, basis);
+        fillField("birthDate", survivor.getBirthDate(), absorbed.getBirthDate(),
+                survivor::setBirthDate, basis);
+        if (survivor.getGender() == null && absorbed.getGender() != null) {
+            survivor.setGender(absorbed.getGender());
+            basis.add("gender filled from " + absorbed.getMpiId());
+        }
+        records.remove(absorbed.getMpiId());
+        mergedAway.put(absorbed.getMpiId(), survivor.getMpiId());
+        basis.add("force-merged " + absorbed.getMpiId() + " into " + survivor.getMpiId()
+                + " (" + reason + ")");
+        return survivor;
+    }
+
+    private static void fillField(String field, String survivorValue, String absorbedValue,
+                                  java.util.function.Consumer<String> setter, List<String> basis) {
+        if (survivorValue == null && absorbedValue != null) {
+            setter.accept(absorbedValue);
+            basis.add(field + " filled from absorbed cluster (survivor value was empty)");
+        } else if (survivorValue != null) {
+            basis.add(field + " kept from survivor record (existing value wins)");
+        }
+    }
+
+    private void lenientAttachAndFill(MasterPatientRecord record,
+                                      NormalizedPatient patient,
+                                      List<String> basis) {
+        for (PatientIdentifier identifier : patient.getIdentifiers()) {
+            String key = identifier.canonicalKey();
+            String previous = identifierToMpi.putIfAbsent(key, record.getMpiId());
+            if (previous == null) {
+                record.addIdentifier(identifier);
+                basis.add("linked identifier " + key);
+            } else if (!previous.equals(record.getMpiId())) {
+                identifierToMpi.put(key, record.getMpiId());
+                record.addIdentifier(identifier);
+                basis.add("relinked identifier " + key + " (formerly owned by "
+                        + resolveMpi(previous) + ")");
+            } else {
+                basis.add("identifier already known (idempotent) " + key);
+            }
+        }
+        if (record.getFamilyName() == null && patient.getFamilyName() != null) {
+            record.setFamilyName(patient.getFamilyName());
+            basis.add("familyName filled from incoming submission");
+        }
+        if (record.getGivenName() == null && patient.getGivenName() != null) {
+            record.setGivenName(patient.getGivenName());
+            basis.add("givenName filled from incoming submission");
+        }
+        if (record.getBirthDate() == null && patient.getBirthDate() != null) {
+            record.setBirthDate(patient.getBirthDate());
+            basis.add("birthDate filled from incoming submission");
+        }
+        if (record.getGender() == null && patient.getGender() != null) {
+            record.setGender(patient.getGender());
+            basis.add("gender filled from incoming submission");
+        }
+    }
+
     private MasterPatientRecord createRecord() {
         String mpiId = String.format("MPI-%010d", sequence.incrementAndGet());
         MasterPatientRecord record = new MasterPatientRecord(mpiId);
@@ -114,20 +399,25 @@ public class MasterPatientIndex {
         return record;
     }
 
-    private static void assertCompatible(MasterPatientRecord a, MasterPatientRecord b, String linkKey) {
+    private static void assertCompatible(MasterPatientRecord a, MasterPatientRecord b,
+                                         String linkKey,
+                                         java.util.List<String> absorbedBefore) {
         if (a.getBirthDate() != null && b.getBirthDate() != null
                 && !a.getBirthDate().equals(b.getBirthDate())) {
-            throw new IngestionException(RejectionReason.CONTRADICTORY_DATA,
-                    "refusing merge: identifier " + linkKey + " links records with conflicting birth dates ("
-                            + a.getMpiId() + " " + a.getBirthDate() + " vs "
-                            + b.getMpiId() + " " + b.getBirthDate() + ")");
+            throw new ConflictException(ConflictType.BIRTH_DATE,
+                    a.getMpiId(), b.getMpiId(), linkKey,
+                    "refusing merge: identifier " + linkKey
+                            + " links records with conflicting birth dates; "
+                            + "routed to manual review", absorbedBefore);
         }
         if (a.getFamilyName() != null && b.getFamilyName() != null
                 && !a.getFamilyName().equalsIgnoreCase(b.getFamilyName())
                 && a.getBirthDate() != null && a.getBirthDate().equals(b.getBirthDate())) {
-            throw new IngestionException(RejectionReason.CONTRADICTORY_DATA,
-                    "refusing merge: identifier " + linkKey + " links records with same birth date "
-                            + "but conflicting family names");
+            throw new ConflictException(ConflictType.FAMILY_NAME,
+                    a.getMpiId(), b.getMpiId(), linkKey,
+                    "refusing merge: identifier " + linkKey
+                            + " links records with same birth date but conflicting family names; "
+                            + "routed to manual review", absorbedBefore);
         }
     }
 
@@ -136,17 +426,17 @@ public class MasterPatientIndex {
                                                  String matchedKey) {
         if (record.getBirthDate() != null && incoming.getBirthDate() != null
                 && !record.getBirthDate().equals(incoming.getBirthDate())) {
-            throw new IngestionException(RejectionReason.CONTRADICTORY_DATA,
-                    "refusing update: identifier " + matchedKey + " resolves to "
-                            + record.getMpiId() + " with birthDate " + record.getBirthDate()
-                            + " but incoming birthDate is " + incoming.getBirthDate());
+            throw new ConflictException(ConflictType.BIRTH_DATE, record.getMpiId(), null,
+                    matchedKey, "refusing update: identifier " + matchedKey + " resolves to "
+                            + record.getMpiId() + " but incoming birthDate conflicts; "
+                            + "routed to manual review");
         }
         if (record.getFamilyName() != null && incoming.getFamilyName() != null
                 && !record.getFamilyName().equalsIgnoreCase(incoming.getFamilyName())) {
-            throw new IngestionException(RejectionReason.CONTRADICTORY_DATA,
-                    "refusing update: identifier " + matchedKey + " resolves to "
-                            + record.getMpiId() + " family '" + record.getFamilyName()
-                            + "' but incoming family is '" + incoming.getFamilyName() + "'");
+            throw new ConflictException(ConflictType.FAMILY_NAME, record.getMpiId(), null,
+                    matchedKey, "refusing update: identifier " + matchedKey + " resolves to "
+                            + record.getMpiId() + " but incoming family name conflicts; "
+                            + "routed to manual review");
         }
     }
 
@@ -173,6 +463,7 @@ public class MasterPatientIndex {
             survivor.setGender(absorbed.getGender());
         }
         records.remove(absorbed.getMpiId());
+        mergedAway.put(absorbed.getMpiId(), survivor.getMpiId());
         basis.add("merged " + absorbed.getMpiId() + " into " + survivor.getMpiId()
                 + " via shared identifier " + linkKey);
         return survivor;

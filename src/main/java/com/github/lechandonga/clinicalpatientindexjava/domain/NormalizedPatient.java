@@ -71,9 +71,10 @@ public class NormalizedPatient {
         String name = fullName();
         String maskedName = name == null ? "null"
                 : name.charAt(0) + "*(" + name.length() + ")";
+        String birthYear = birthDate == null ? "null" : birthDate.substring(0, 4);
         return "identifiers=" + identifiers.size()
                 + ", name=" + maskedName
-                + ", birthDate=" + birthDate
+                + ", birthYear=" + birthYear
                 + ", gender=" + gender
                 + ", notes=" + notes;
     }

@@ -15,10 +15,11 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(IngestionException.class)
     public ResponseEntity<Map<String, String>> handleIngestion(IngestionException e) {
         HttpStatus status = switch (e.getReason()) {
-            case MALFORMED_MESSAGE, INVALID_DATE -> HttpStatus.BAD_REQUEST;
+            case MALFORMED_MESSAGE, INVALID_DATE, INVALID_DECISION -> HttpStatus.BAD_REQUEST;
             case MISSING_REQUIRED_FIELD, ILLEGAL_IDENTIFIER -> HttpStatus.UNPROCESSABLE_ENTITY;
             case UNSUPPORTED_FORMAT -> HttpStatus.UNSUPPORTED_MEDIA_TYPE;
-            case CONTRADICTORY_DATA -> HttpStatus.CONFLICT;
+            case CONTRADICTORY_DATA, REVIEW_QUEUE_FULL, REVIEW_ALREADY_DECIDED -> HttpStatus.CONFLICT;
+            case REVIEW_TASK_NOT_FOUND -> HttpStatus.NOT_FOUND;
         };
         return ResponseEntity.status(status).body(Map.of(
                 "error", "REJECTED",
