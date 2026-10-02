@@ -19,6 +19,7 @@ public class ApiAuthenticator {
     public static final String SCOPE_INGEST = "patient:ingest";
     public static final String SCOPE_QUERY = "patient:query";
     public static final String SCOPE_AUDIT_READ = "audit:read";
+    public static final String SCOPE_REVIEW = "patient:review";
 
     private final Map<String, Caller> tokenStore = new LinkedHashMap<>();
 
@@ -31,6 +32,8 @@ public class ApiAuthenticator {
                 new Caller("analyst", Set.of(SCOPE_QUERY)));
         tokenStore.put("admin-token",
                 new Caller("admin", Set.of(SCOPE_QUERY, SCOPE_AUDIT_READ)));
+        tokenStore.put("reviewer-token",
+                new Caller("reviewer", Set.of(SCOPE_REVIEW)));
         parseConfigured(configuredTokens);
     }
 

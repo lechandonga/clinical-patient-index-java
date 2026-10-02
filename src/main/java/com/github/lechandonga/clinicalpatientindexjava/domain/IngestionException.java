@@ -36,6 +36,8 @@ public class IngestionException extends RuntimeException {
         /** 时间/日期格式无法按规则补全或解析。 */
         INVALID_DATE,
         /** 同一消息内部互相矛盾且无法裁决的数据。 */
-        CONTRADICTORY_DATA
+        CONTRADICTORY_DATA,
+        /** 触发了冲突，但人工复核待办队列已达上限。 */
+        REVIEW_QUEUE_FULL
     }
 }

@@ -27,4 +27,11 @@ public class AuditLog {
     public List<AuditEvent> findByActor(String actor) {
         return events.stream().filter(e -> e.actor().equals(actor)).toList();
     }
+
+    /**
+     * 仅供本地测试隔离使用。
+     */
+    public void resetForTesting() {
+        events.clear();
+    }
 }
