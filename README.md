@@ -175,7 +175,13 @@ curl -s http://localhost:8080/api/audit/events -H "Authorization: Bearer admin-t
 `409 CONTRADICTORY_DATA`，老接入方无需改动；唯一变化是服务端在同一把归并锁内
 额外生成一条待复核记录。冲突检测发生在任何索引写入之前，因此拒绝对数据零副作用：
 事后按原标识查询仍各自落在原来的主索引上，归属与人口学不变；未决期间查询看到的
-始终是独立主索引，绝不提前合并。
+始终是独立主索引，绝不提前合并。具体地，归并分两阶段且全部在同一把归并锁内：
+先只读地解析消息命中的所有已有簇，完成“簇与簇之间”和“来件与每个命中簇之间”
+的全部人口学校验；**只有全部通过后**才允许创建/合簇、移动标识或更新人口学。
+因此即使消息同时携带两个彼此一致的已有患者标识、仅来件本身的出生日期或姓氏
+与已有记录冲突，拒绝也不会留下任何痕迹（主索引数、标识归属、人口学逐字段不变）。
+一条消息把两个已有患者串起来时，冲突与待办都会携带**双方** MPI，待办中双方
+患者均可见。
 
 待办记录（仅 `patient:review` scope 可访问）：
 
@@ -224,6 +230,15 @@ curl -s http://localhost:8080/api/audit/events -H "Authorization: Bearer admin-t
   返回 REVIEW_QUEUE_FULL 且无副作用、16 线程并发批准只生效一次且返回一致、
   24 线程批准与重复冲突接入交叉时无重复/半合并、驳回后归属与人口学不变、
   单簇冲突批准只补空值不覆盖、确定的幸存者选择与字段取舍。
+- `ConflictNoSideEffectsTest`：固定联调缺陷场景——两个彼此一致的已有患者
+  （同名同生日，分两次各带一个标识登记）被一条双标识消息链接，而来件出生日期
+  或姓氏冲突时：拒绝前后主索引数量、标识归属、人口学与按标识查询视图逐字段不变；
+  待办包含双方稳定替代标识、冲突类别、提交人、提交时间与字段取舍方案；反复提交
+  返回相同拒绝且只累加 submissionCount；队列满返回可区分的 REVIEW_QUEUE_FULL
+  且同样零改动；批准后两边标识落同一主索引、替代标识稳定、冲突字段以现有值为准；
+  驳回后回到原状；批准/驳回重复、并发与相反裁决均幂等；24 线程重复提交与批准
+  交叉后任意标识查询视图一致。日志打印 `[TEST INPUT]` 输入摘要与 `[TEST BASIS]`
+  判定依据。
 - `ReviewEndToEndApiTest`：预检/待办/裁决全链路 HTTP 行为，冲突对外仍 409
   CONTRADICTORY_DATA，越权三态区分，批准后两边标识归一，审计覆盖新流程且无明文。
 - `AuditPrivacyTest`：穷举新流程各审计路径，扫描全部事件不含姓名、原始标识符
@@ -245,4 +260,37 @@ curl -s -X POST http://localhost:8080/api/reviews/REV-0000000001/decision \
 
 # 配置待办上限后重启验证 REVIEW_QUEUE_FULL
 MPI_REVIEW_QUEUE_LIMIT=1 mvn spring-boot:run
+```
+
+验证“拒绝冲突零副作用”的最短本地路径：
+
+```bash
+# 1. 分两次登记两个同名同生日、各带一个标识的患者
+curl -s -X POST http://localhost:8080/api/patients/ingest \
+  -H "Authorization: Bearer ingest-token-a" -H "Content-Type: text/plain" \
+  --data-binary $'MSH|^~\\&|HIS_A|HOSPITAL_A|MPI|MPI|20261001120000||ADT^A04^ADT_A01|M1|P|2.5.1\nPID|1||MRN-9001^^^HOSPITAL_A^MR||Zhang^^||19900505|F'
+curl -s -X POST http://localhost:8080/api/patients/ingest \
+  -H "Authorization: Bearer ingest-token-b" -H "Content-Type: application/json" \
+  -d '{"resourceType":"Patient","identifier":[{"system":"HOSPITAL_B","value":"MRN-9002"}],"name":[{"family":"Zhang"}],"gender":"female","birthDate":"1990-05-05"}'
+
+# 2. 双标识 + 冲突出生日期提交，预期 409 CONTRADICTORY_DATA
+curl -i -X POST http://localhost:8080/api/patients/ingest \
+  -H "Authorization: Bearer ingest-token-a" -H "Content-Type: text/plain" \
+  --data-binary $'MSH|^~\\&|HIS_A|HOSPITAL_A|MPI|MPI|20261001120000||ADT^A04^ADT_A01|M2|P|2.5.1\nPID|1||MRN-9001^^^HOSPITAL_A^MR~MRN-9002^^^HOSPITAL_B^MR||Zhang^^||19880808|F'
+
+# 3. 裁决前按任一标识查询：两个 pseudonym 不同、linkedIdentifierCount 均为 1（未提前合并）
+curl -s "http://localhost:8080/api/patients?system=HOSPITAL_A&identifier=MRN-9001" \
+  -H "Authorization: Bearer query-token"
+curl -s "http://localhost:8080/api/patients?system=HOSPITAL_B&identifier=MRN-9002" \
+  -H "Authorization: Bearer query-token"
+
+# 4. 待办中能看到双方 pseudonyms（无明文），随后 REJECT：查询结果与第 3 步完全一致
+curl -s http://localhost:8080/api/reviews -H "Authorization: Bearer reviewer-token"
+# 改为 APPROVE 时，两个标识才会落到同一主索引，且幸存者 pseudonym 保持不变
+```
+
+自动化方式直接运行：
+
+```bash
+mvn -Dtest=ConflictNoSideEffectsTest test
 ```

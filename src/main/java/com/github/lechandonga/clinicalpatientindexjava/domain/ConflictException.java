@@ -24,7 +24,6 @@ public class ConflictException extends IngestionException {
     private final String mpiA;
     private final String mpiB;
     private final String linkIdentifierKey;
-    private final String absorbedMpi;
     private final List<String> extraMpis;
 
     public ConflictException(ConflictType conflictType,
@@ -47,7 +46,6 @@ public class ConflictException extends IngestionException {
         this.mpiB = mpiB;
         this.linkIdentifierKey = linkIdentifierKey;
         this.extraMpis = List.copyOf(extraMpis);
-        this.absorbedMpi = extraMpis.isEmpty() ? null : extraMpis.get(extraMpis.size() - 1);
     }
 
     public ConflictType getConflictType() {
@@ -66,13 +64,6 @@ public class ConflictException extends IngestionException {
         ids.addAll(extraMpis);
         ids.sort(String::compareTo);
         return ids.stream().distinct().toList();
-    }
-
-    public ConflictException withAbsorbedMpi(String absorbed) {
-        List<String> all = new java.util.ArrayList<>(extraMpis);
-        all.add(absorbed);
-        return new ConflictException(conflictType, mpiA, mpiB, linkIdentifierKey,
-                getMessage(), all);
     }
 
     public String getLinkIdentifierKey() {
