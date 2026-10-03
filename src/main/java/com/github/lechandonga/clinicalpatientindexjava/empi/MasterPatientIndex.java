@@ -62,6 +62,13 @@ public class MasterPatientIndex {
     }
 
     private MergeResult doUpsert(NormalizedPatient patient) {
+        // 阶段一：纯只读校验。先把本次提交涉及的所有已存在簇解析出来，
+        // 在局部投影上检查“簇之间是否兼容”以及“合簇后的人口学是否与来件兼容”。
+        // 任何冲突都在触碰 records / identifierToMpi 之前抛出，
+        // 因此被拒绝的提交不会产生半合并、标识改挂或字段覆盖。
+        List<MasterPatientRecord> matched = resolveMatchedClusters(patient);
+
+        // 阶段二：校验全部通过后才允许落库，此阶段不再可能抛冲突异常。
         List<String> basis = new ArrayList<>();
         MasterPatientRecord target = null;
 
@@ -76,26 +83,17 @@ public class MasterPatientIndex {
                 target = existing;
                 basis.add("matched identifier " + key);
             } else if (!existing.getMpiId().equals(target.getMpiId())) {
-                assertCompatible(target, existing, key, previouslyMergedIds(basis));
                 target = mergeInto(target, existing, basis, key);
             }
         }
 
         boolean created = false;
-        boolean merged = target != null && !basis.isEmpty();
         if (target == null) {
             target = createRecord();
             created = true;
             basis.add("no matching identifier; created new MPI");
-        } else {
-            for (PatientIdentifier identifier : patient.getIdentifiers()) {
-                String mpi = identifierToMpi.get(identifier.canonicalKey());
-                if (mpi != null && mpi.equals(target.getMpiId())) {
-                    assertIncomingCompatible(target, patient, identifier.canonicalKey());
-                    break;
-                }
-            }
         }
+        boolean merged = matched.size() > 1;
 
         for (PatientIdentifier identifier : patient.getIdentifiers()) {
             String previous = identifierToMpi.putIfAbsent(identifier.canonicalKey(), target.getMpiId());
@@ -112,15 +110,136 @@ public class MasterPatientIndex {
         return new MergeResult(target.getMpiId(), created, merged, List.copyOf(basis));
     }
 
-    /** 从 basis 文本中提取本次 upsert 已合入 target 的 MPI id（仅进程内使用）。 */
-    private static java.util.List<String> previouslyMergedIds(List<String> basis) {
-        java.util.List<String> ids = new java.util.ArrayList<>();
-        java.util.regex.Matcher matcher =
-                java.util.regex.Pattern.compile("\\bMPI-\\d{10}\\b").matcher(String.join(" ", basis));
-        while (matcher.find()) {
-            ids.add(matcher.group());
+    /**
+     * 只读解析本次提交命中的全部已存在簇（按标识出现顺序、去重），
+     * 同时完成两类冲突校验，任何状态写入都尚未发生：
+     * <ol>
+     *   <li>被同一消息串起来的簇之间：出生日期冲突，或出生日期相同但姓氏冲突；</li>
+     *   <li>投影合簇后的人口学与来件之间：出生日期或姓氏冲突。</li>
+     * </ol>
+     * 抛出的冲突异常携带全部涉及的主索引，保证待办能如实列出双方
+     * （或多方），去重键也覆盖完整患者集合。
+     */
+    private List<MasterPatientRecord> resolveMatchedClusters(NormalizedPatient patient) {
+        List<MasterPatientRecord> matched = new ArrayList<>();
+        ProjectedDemographics projected = null;
+        String firstMatchedIncomingKey = null;
+        for (PatientIdentifier identifier : patient.getIdentifiers()) {
+            String key = identifier.canonicalKey();
+            String existingMpi = identifierToMpi.get(key);
+            if (existingMpi == null) {
+                continue;
+            }
+            MasterPatientRecord existing = records.get(existingMpi);
+            if (matched.stream().anyMatch(r -> r.getMpiId().equals(existing.getMpiId()))) {
+                continue;
+            }
+            if (projected == null) {
+                firstMatchedIncomingKey = key;
+                matched.add(existing);
+                projected = ProjectedDemographics.of(existing);
+            } else {
+                assertClustersCompatible(matched.get(0), existing, matched, projected, key);
+                projected.absorb(existing);
+                matched.add(existing);
+            }
         }
-        return ids;
+        if (projected != null) {
+            assertIncomingCompatible(matched, projected, patient, firstMatchedIncomingKey);
+        }
+        return matched;
+    }
+
+    /** 合簇过程中的人口学投影：已有簇非空字段保留，空值由后续簇补全。 */
+    private static final class ProjectedDemographics {
+        private String familyName;
+        private String birthDate;
+
+        static ProjectedDemographics of(MasterPatientRecord record) {
+            ProjectedDemographics p = new ProjectedDemographics();
+            p.familyName = record.getFamilyName();
+            p.birthDate = record.getBirthDate();
+            return p;
+        }
+
+        void absorb(MasterPatientRecord record) {
+            if (familyName == null) {
+                familyName = record.getFamilyName();
+            }
+            if (birthDate == null) {
+                birthDate = record.getBirthDate();
+            }
+        }
+    }
+
+    private static void assertClustersCompatible(MasterPatientRecord first,
+                                                 MasterPatientRecord candidate,
+                                                 List<MasterPatientRecord> priorMatched,
+                                                 ProjectedDemographics projected,
+                                                 String linkKey) {
+        if (projected.birthDate != null && candidate.getBirthDate() != null
+                && !projected.birthDate.equals(candidate.getBirthDate())) {
+            throw new ConflictException(ConflictType.BIRTH_DATE,
+                    first.getMpiId(), candidate.getMpiId(), linkKey,
+                    "refusing merge: identifier " + linkKey
+                            + " links records with conflicting birth dates; "
+                            + "routed to manual review",
+                    otherMpiIds(first, candidate, priorMatched));
+        }
+        if (projected.familyName != null && candidate.getFamilyName() != null
+                && !projected.familyName.equalsIgnoreCase(candidate.getFamilyName())
+                && projected.birthDate != null
+                && projected.birthDate.equals(candidate.getBirthDate())) {
+            throw new ConflictException(ConflictType.FAMILY_NAME,
+                    first.getMpiId(), candidate.getMpiId(), linkKey,
+                    "refusing merge: identifier " + linkKey
+                            + " links records with same birth date but conflicting family names; "
+                            + "routed to manual review",
+                    otherMpiIds(first, candidate, priorMatched));
+        }
+    }
+
+    private static void assertIncomingCompatible(List<MasterPatientRecord> matched,
+                                                 ProjectedDemographics projected,
+                                                 NormalizedPatient incoming,
+                                                 String matchedKey) {
+        MasterPatientRecord first = matched.get(0);
+        if (projected.birthDate != null && incoming.getBirthDate() != null
+                && !projected.birthDate.equals(incoming.getBirthDate())) {
+            throw new ConflictException(ConflictType.BIRTH_DATE,
+                    first.getMpiId(), null, matchedKey,
+                    "refusing update: identifiers resolve to " + matchedMpiIds(matched)
+                            + " but incoming birthDate conflicts with existing records; "
+                            + "routed to manual review",
+                    otherMpiIds(first, null, matched));
+        }
+        if (projected.familyName != null && incoming.getFamilyName() != null
+                && !projected.familyName.equalsIgnoreCase(incoming.getFamilyName())) {
+            throw new ConflictException(ConflictType.FAMILY_NAME,
+                    first.getMpiId(), null, matchedKey,
+                    "refusing update: identifiers resolve to " + matchedMpiIds(matched)
+                            + " but incoming family name conflicts with existing records; "
+                            + "routed to manual review",
+                    otherMpiIds(first, null, matched));
+        }
+    }
+
+    private static List<String> matchedMpiIds(List<MasterPatientRecord> matched) {
+        return matched.stream().map(MasterPatientRecord::getMpiId).sorted().distinct().toList();
+    }
+
+    /** 除显式 a/b 两方外，本次命中的其余主索引（多簇场景下保证待办不遗漏任何一方）。 */
+    private static List<String> otherMpiIds(MasterPatientRecord a,
+                                            MasterPatientRecord b,
+                                            List<MasterPatientRecord> matched) {
+        List<String> others = new ArrayList<>();
+        for (MasterPatientRecord record : matched) {
+            String id = record.getMpiId();
+            if (!id.equals(a.getMpiId()) && (b == null || !id.equals(b.getMpiId()))) {
+                others.add(id);
+            }
+        }
+        return List.copyOf(others);
     }
 
     /**
@@ -399,46 +518,6 @@ public class MasterPatientIndex {
         return record;
     }
 
-    private static void assertCompatible(MasterPatientRecord a, MasterPatientRecord b,
-                                         String linkKey,
-                                         java.util.List<String> absorbedBefore) {
-        if (a.getBirthDate() != null && b.getBirthDate() != null
-                && !a.getBirthDate().equals(b.getBirthDate())) {
-            throw new ConflictException(ConflictType.BIRTH_DATE,
-                    a.getMpiId(), b.getMpiId(), linkKey,
-                    "refusing merge: identifier " + linkKey
-                            + " links records with conflicting birth dates; "
-                            + "routed to manual review", absorbedBefore);
-        }
-        if (a.getFamilyName() != null && b.getFamilyName() != null
-                && !a.getFamilyName().equalsIgnoreCase(b.getFamilyName())
-                && a.getBirthDate() != null && a.getBirthDate().equals(b.getBirthDate())) {
-            throw new ConflictException(ConflictType.FAMILY_NAME,
-                    a.getMpiId(), b.getMpiId(), linkKey,
-                    "refusing merge: identifier " + linkKey
-                            + " links records with same birth date but conflicting family names; "
-                            + "routed to manual review", absorbedBefore);
-        }
-    }
-
-    private static void assertIncomingCompatible(MasterPatientRecord record,
-                                                 NormalizedPatient incoming,
-                                                 String matchedKey) {
-        if (record.getBirthDate() != null && incoming.getBirthDate() != null
-                && !record.getBirthDate().equals(incoming.getBirthDate())) {
-            throw new ConflictException(ConflictType.BIRTH_DATE, record.getMpiId(), null,
-                    matchedKey, "refusing update: identifier " + matchedKey + " resolves to "
-                            + record.getMpiId() + " but incoming birthDate conflicts; "
-                            + "routed to manual review");
-        }
-        if (record.getFamilyName() != null && incoming.getFamilyName() != null
-                && !record.getFamilyName().equalsIgnoreCase(incoming.getFamilyName())) {
-            throw new ConflictException(ConflictType.FAMILY_NAME, record.getMpiId(), null,
-                    matchedKey, "refusing update: identifier " + matchedKey + " resolves to "
-                            + record.getMpiId() + " but incoming family name conflicts; "
-                            + "routed to manual review");
-        }
-    }
 
     private MasterPatientRecord mergeInto(MasterPatientRecord survivor,
                                           MasterPatientRecord absorbed,

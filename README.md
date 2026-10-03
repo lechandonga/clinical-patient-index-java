@@ -177,6 +177,20 @@ curl -s http://localhost:8080/api/audit/events -H "Authorization: Bearer admin-t
 事后按原标识查询仍各自落在原来的主索引上，归属与人口学不变；未决期间查询看到的
 始终是独立主索引，绝不提前合并。
 
+**实现保证（两阶段接入）**：正式接入分“只读投影校验 → 落库”两步。
+第一步先把本次消息涉及的全部已存在簇解析到局部投影上，检查簇之间以及投影结果
+与来件之间是否存在出生日期 / 姓氏冲突；任何冲突都在触碰主索引记录、标识归属表
+之前抛出，不存在“先合并、后发现冲突再回滚”的路径。因此即使两个已存在患者
+彼此完全一致（同生日、同姓名），只是来件人口学与他们冲突，拒绝后：
+
+- 主索引数量不变，两个标识仍各自指向原来的 MPI，标识数不变；
+- 双方人口学字段（含姓氏、出生日期）原样保留；
+- 冲突待办同时列出**双方**患者的替代标识（多簇场景同样不遗漏任何一方），
+  未裁决前系统绝不会把他们合到一起；
+- 同一条消息反复提交得到同样的 `409 CONTRADICTORY_DATA`，只在原待办上累加
+  `submissionCount`，不重复堆待办；待办满时改返回可区分的 `409 REVIEW_QUEUE_FULL`，
+  同样不产生任何数据改动。
+
 待办记录（仅 `patient:review` scope 可访问）：
 
 - 涉及的已有患者只以**替代标识**（`pseudonyms`）表示，内部 MPI id 不出现在
@@ -226,6 +240,14 @@ curl -s http://localhost:8080/api/audit/events -H "Authorization: Bearer admin-t
   单簇冲突批准只补空值不覆盖、确定的幸存者选择与字段取舍。
 - `ReviewEndToEndApiTest`：预检/待办/裁决全链路 HTTP 行为，冲突对外仍 409
   CONTRADICTORY_DATA，越权三态区分，批准后两边标识归一，审计覆盖新流程且无明文。
+- `ConflictRejectionIsolationTest`：复现并固化“拒绝零副作用”——两个已登记患者
+  彼此一致、来件仅出生日期冲突，或仅姓氏冲突，拒绝前后对比主索引数量、标识归属、
+  人口学与按标识查询结果（全部原样），待办必须同时列出双方稳定替代标识与
+  类别/提交人/时间；同消息反复提交去重不堆待办；待办打满返回独立的
+  `REVIEW_QUEUE_FULL` 且无改动；批准后两边原子归一、幸存者替代标识稳定、
+  冲突字段以幸存者为准且裁决幂等；32 线程提交/裁决穿插与 16 线程并发驳回
+  只生效一次、无重复 MPI / 半合并 / 覆盖。测试日志均带 `[TEST INPUT]`
+  输入摘要与 `[TEST BASIS]` 判定依据。
 - `AuditPrivacyTest`：穷举新流程各审计路径，扫描全部事件不含姓名、原始标识符
   与出生日期明文。
 
@@ -245,4 +267,19 @@ curl -s -X POST http://localhost:8080/api/reviews/REV-0000000001/decision \
 
 # 配置待办上限后重启验证 REVIEW_QUEUE_FULL
 MPI_REVIEW_QUEUE_LIMIT=1 mvn spring-boot:run
+```
+
+“拒绝零副作用”场景的本地验证：
+
+```bash
+# 1) 自动化测试（日志带 [TEST INPUT] 输入摘要与 [TEST BASIS] 判定依据）
+mvn test -Dtest=ConflictRejectionIsolationTest
+mvn test                       # 全量回归，原有测试必须继续全部通过
+
+# 2) 手动联调：先分两次各带一个标识登记两个彼此一致的患者，
+#    再用同时带两个标识、但出生日期（或姓氏）不一致的消息接入，
+#    预期 409 CONTRADICTORY_DATA；随后分别按两个标识查询，
+#    必须仍落在两个不同主索引、标识数与人口学均不变，
+#    GET /api/reviews 的待办 pseudonyms 中应同时出现双方；
+#    批准后两标识归一、替代标识稳定，驳回后回到两个独立主索引。
 ```
